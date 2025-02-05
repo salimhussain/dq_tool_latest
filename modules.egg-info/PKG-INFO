@@ -1,0 +1,17 @@
+Metadata-Version: 2.2
+Name: modules
+Version: 0.1.0
+Summary: A data quality tool for managing and validating data.
+Author: salim Name
+Author-email: your.email@example.com
+Classifier: Programming Language :: Python :: 3.9
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Description-Content-Type: text/markdown
+Requires-Dist: great_expectations==0.18.19
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: description-content-type
+Dynamic: requires-dist
+Dynamic: summary

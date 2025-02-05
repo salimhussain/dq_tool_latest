@@ -1,0 +1,2 @@
+[console_scripts]
+main = dq_tool.main:main

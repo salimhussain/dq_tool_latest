@@ -1,9 +1,9 @@
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.types import StructType
-from pyspark.sql.functions import col, lit, coalesce
+from pyspark.sql.functions import col, lit, coalesce, concat_ws, row_number
+from pyspark.sql.window import Window
 
 from typing import Dict, List
-from delta.tables import DeltaTable
 
 from schemas.data_model.dq_exceptions_schema import DQ_EXCEPTIONS_SCHEMA
 from schemas.data_model.dq_validations_schema import DQ_VALIDATIONS_SCHEMA
@@ -46,6 +46,12 @@ class DataModelManager:
     DQ_EXCEPTIONS = "dqops.dq_exceptions"
     DQ_VALIDATIONS = "dqops.dq_validations"
 
+    def __init__(self, data_source: str):
+        self.data_source = data_source
+        if self.data_source == "DeltaTable":
+            from delta.tables import DeltaTable
+            self.DeltaTable = DeltaTable
+
     def merge_in_table(
         self,
         df: DataFrame,
@@ -53,41 +59,70 @@ class DataModelManager:
         primary_key: str = "integration_id",
         destination_table: str = "dqops.dq_rule",
     ) -> None:
-        """Generic method to store data into a Delta table with upsert or insert-only logic.
+        """Generic method to store data into a Hive or Delta table with upsert or insert-only logic.
 
-        :param data: List of dictionaries to be stored.
-        :param schema: The schema of the table.
-        :param table_path: Path to the Delta table.
+        :param df: The DataFrame to be stored.
+        :param columns: List of columns to be upserted.
         :param primary_key: The primary key column for upsert logic.
         :param destination_table: The destination table to upsert into.
         """
+        #debug print
+        print(f"Data source in merge_in_table: {self.data_source}")
         try:
-            delta_table = DeltaTable.forName(spark, destination_table)
-            (
-                delta_table.alias("target")
-                .merge(
-                    df.alias("source"),
-                    f"target.{primary_key} = source.{primary_key}",
+            if self.data_source == "Hive":
+                temp_view_name = "temp_view"
+
+                # Create a temporary view from the DataFrame
+                df.createOrReplaceTempView(temp_view_name)
+
+                # Perform the upsert operation using SQL
+                spark.sql(f"""
+                    INSERT OVERWRITE TABLE {destination_table}
+                    SELECT * FROM (
+                        SELECT
+                            COALESCE(source.{primary_key}, target.{primary_key}) AS {primary_key},
+                            {', '.join([f'COALESCE(source.{col}, target.{col}) AS {col}' for col in columns if col != primary_key])}
+                        FROM {destination_table} target
+                        FULL OUTER JOIN {temp_view_name} source
+                        ON target.{primary_key} = source.{primary_key}
+                    ) merged
+                """)
+            elif self.data_source == "DeltaTable":
+                delta_table = self.DeltaTable.forName(spark, destination_table)
+                (
+                    delta_table.alias("target")
+                    .merge(
+                        df.alias("source"),
+                        f"target.{primary_key} = source.{primary_key}",
+                    )
+                    .whenMatchedUpdate(set={col: f"source.{col}" for col in columns})
+                    .whenNotMatchedInsert(values={col: f"source.{col}" for col in columns})
+                    .execute()
                 )
-                .whenMatchedUpdate(set={col: f"source.{col}" for col in columns})
-                .whenNotMatchedInsert(values={col: f"source.{col}" for col in columns})
-                .execute()
-            )
+            else:
+                raise ValueError(f"Unsupported data source: {self.data_source}")
         except Exception as e:
             raise ValueError(
                 f"Error upserting data into table {destination_table}: {e}"
             )
 
     def _store_in_table(self, df: DataFrame, table_path: str) -> None:
-        """Store data into a Delta table by appending new rows.
+        """Store data into a Hive table by appending new rows.
 
         :param df: Spark DataFrame containing the data to store.
-        :param table_path: Path to the Delta table.
+        :param table_path: Path to the Hive table.
         """
+        #debug print
+        print(f"Data source in store_in_table: {self.data_source}")
         try:
-            df.write.format("delta").mode("append").saveAsTable(table_path)
+            if self.data_source == "Hive":
+                df.write.format("hive").mode("append").saveAsTable(table_path)
+            elif self.data_source == "DeltaTable":
+                df.write.format("delta").mode("append").saveAsTable(table_path)
+            else:
+                raise ValueError(f"Unsupported data source: {self.data_source}")
         except Exception as e:
-            raise ValueError(f"Error storing data in Delta table {table_path}: {e}")
+            raise ValueError(f"Error storing data in table {table_path}: {e}")
 
     def save_expectation_suite(self, expectations: list) -> None:
         """Save the expectation suite to the data model.
@@ -110,6 +145,15 @@ class DataModelManager:
             fixed_exception_count = 0
             new_exception_count = 0
 
+            if self.data_source == "Hive":
+                # Get the maximum value of 'exception_key' from the existing table
+                max_exception_key_df = spark.sql("SELECT MAX(exception_key) as max_exception_key FROM dqops.dq_exceptions")
+                max_exception_key = max_exception_key_df.collect()[0]['max_exception_key']
+
+                # If there is no existing value, start with 1
+                if max_exception_key is None:
+                    max_exception_key = 0
+
             if exceptions:
                 print(f"\t[*] Processing {len(exceptions)} exceptions for rule", validation.rule_key, "-", expectation.rule_no)
                 
@@ -128,6 +172,20 @@ class DataModelManager:
                 all_exception_df = current_exception_df.unionByName(
                     fixed_exception_df, allowMissingColumns=False
                 ).unionByName(new_exception_df, allowMissingColumns=False)
+
+                if self.data_source == "Hive":
+                    # Add the 'integration_id' column
+                    all_exception_df = all_exception_df.withColumn(
+                        'integration_id',
+                        concat_ws('~', all_exception_df['exception_row_pk'], all_exception_df['exception_row_pk'].cast('string'))
+                    )
+
+                    # Add the 'exception_key' column, starting from max_exception_key and increment by 1
+                    window_spec = Window.orderBy("integration_id")
+                    all_exception_df = all_exception_df.withColumn(
+                        'exception_key',
+                        row_number().over(window_spec) + max_exception_key
+                    )
 
                 current_exception_count = current_exception_df.count()
                 fixed_exception_count = fixed_exception_df.count()
@@ -161,10 +219,25 @@ class DataModelManager:
             validations.append(validation.to_dict())
 
         if validations:
-            print(f"[*] Storing {len(validations)} validations in the data model.")        
+            print(f"[*] Storing {len(validations)} validations in the data model.")
+            
+            if self.data_source == "Hive":
+                # Convert integer values to float for the field 'exception_percent_nonmissing'
+                for validation in validations:
+                    if 'exception_percent_nonmissing' in validation:
+                        validation['exception_percent_nonmissing'] = float(validation['exception_percent_nonmissing'])
+            
             validations_df = spark.createDataFrame(
                 validations, DQ_VALIDATIONS_SCHEMA
             )
+
+            if self.data_source == "Hive":
+                # Add the 'integration_id' column
+                validations_df = validations_df.withColumn(
+                    'integration_id',
+                    concat_ws('~', validations_df['rule_key'], validations_df['execution_key'])
+                )
+            
             self._store_in_table(validations_df, self.DQ_VALIDATIONS)
 
     def get_exception_comparison(
@@ -181,15 +254,26 @@ class DataModelManager:
         current_failed_df = spark.createDataFrame(failed_rows, DQ_EXCEPTIONS_SCHEMA)
         
         # Get the latest exception from dq_exception
-        latest_exception_df = (
-            spark.read.format("delta")
-            .table(self.DQ_EXCEPTIONS)
-            .filter(
-                (col("execution_key") == (execution_key - 1))  # Current execution key minus 1
-                & (col("rule_key") == rule_key)
-                & (col("fixed_exception_flag") == False)
+        if self.data_source == "Hive":
+            latest_exception_df = (
+                spark.read.format("hive")
+                .table(self.DQ_EXCEPTIONS)
+                .filter(
+                    (col("execution_key") == (execution_key - 1))  # Current execution key minus 1
+                    & (col("rule_key") == rule_key)
+                    & (col("fixed_exception_flag") == False)
+                )
             )
-        )
+        elif self.data_source == "DeltaTable":
+            latest_exception_df = (
+                spark.read.format("delta")
+                .table(self.DQ_EXCEPTIONS)
+                .filter(
+                    (col("execution_key") == (execution_key - 1))  # Current execution key minus 1
+                    & (col("rule_key") == rule_key)
+                    & (col("fixed_exception_flag") == False)
+                )
+            )
 
         # Skip further processing if there is no latest exception
         if latest_exception_df.isEmpty():

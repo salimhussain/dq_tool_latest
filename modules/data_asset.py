@@ -16,21 +16,23 @@ class DataAsset:
         "catalog",
         "schema",
         "table",
+        "data_source",
         "dataframe",
         "element_count",
         "expectation_manager",
         "num_rules",
     ]
 
-    def __init__(self, catalog: str, schema: str, table: str) -> None:
+    def __init__(self, catalog: str, schema: str, table: str,data_source: str) -> None:
 
         self.catalog = catalog
         self.schema = schema
         self.table = table
+        self.data_source = data_source
 
-        self.dataframe = self._load_dataframe()
+        self.dataframe = self._load_dataframe(data_source)
         self.element_count = self.dataframe.count()
-        self.expectation_manager = ExpectationManager()
+        self.expectation_manager = ExpectationManager(self.data_source)
 
         self.num_rules = 0
 
@@ -53,9 +55,16 @@ class DataAsset:
             results, self.element_count, vaLidation_key, execution_key
         )
 
-    def _load_dataframe(self):
+    def _load_dataframe(self, data_source):
+        #debug print
+        print(f"Data source: {data_source}")
         try:
-            df = spark.read.table(f"{self.catalog}.{self.schema}.{self.table}")
+            if data_source == "Hive":
+                df = spark.read.table(f"{self.schema}.{self.table}")
+            elif data_source == "DeltaTable":
+                df = spark.read.table(f"{self.catalog}.{self.schema}.{self.table}")
+            else:
+                raise ValueError(f"Unsupported data source: {data_source}")
             return df
         except Exception as e:
             logger.error(f"Error loading DataFrame: {e}")

@@ -15,10 +15,12 @@ class ExpectationManager:
 
     __slots__ = [
         "expectations",
+        "data_source",
     ]
 
-    def __init__(self):
+    def __init__(self, data_source: str):
         self.expectations: dict = {}
+        self.data_source = data_source
 
     def _rule_enabled(self, rule) -> bool:
         """Checks if a rule should be executed
@@ -51,7 +53,7 @@ class ExpectationManager:
         self.expectations[expectation.gx_expectation.id] = expectation
         
     def save_expectation_suite(self):
-        data_model_manager = DataModelManager()
+        data_model_manager = DataModelManager(self.data_source)
         data_model_manager.save_expectation_suite(self.expectations.values())
 
     def parse_results(
